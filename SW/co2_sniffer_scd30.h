@@ -22,3 +22,6 @@ bool co2_scd30_tick(Co2Scd30* s);
 
 /** Restart continuous measurement with a new ambient pressure (mbar). */
 bool co2_scd30_set_pressure(uint16_t press_mbar);
+
+/** Stop continuous measurement and enter the sensor's idle low-power state. */
+bool co2_scd30_stop(void);

@@ -7,6 +7,7 @@
 /* SCD30 commands (big-endian 2-byte register addresses) */
 #define SCD_CMD_SOFT_RESET 0xD304
 #define SCD_CMD_START_MEAS 0x0010 /* arg: pressure mbar, 0 = no compensation */
+#define SCD_CMD_STOP_MEAS 0x0104
 #define SCD_CMD_SET_INTERVAL 0x4600
 #define SCD_CMD_SET_ASC 0x5306
 #define SCD_CMD_READY 0x0202
@@ -130,4 +131,10 @@ bool co2_scd30_set_pressure(uint16_t press_mbar) {
     d[1] = press_mbar & 0xFF;
     d[2] = sen_crc(d, 2);
     return scd30_write(SCD_CMD_START_MEAS, d, 3);
+}
+
+bool co2_scd30_stop(void) {
+    bool stopped = scd30_cmd(SCD_CMD_STOP_MEAS);
+    if(stopped) furi_delay_ms(500); /* command execution time from the datasheet */
+    return stopped;
 }
