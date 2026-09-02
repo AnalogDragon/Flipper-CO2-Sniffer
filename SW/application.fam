@@ -1,0 +1,16 @@
+# For details & more options, see documentation/AppManifests.md in firmware repo
+
+App(
+    appid="co2_sniffer",  # Must be unique
+    name="CO2-Sniffer",  # Displayed in menus
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="co2_sniffer_app",
+    stack_size=4 * 1024,
+    fap_category="DIY",
+    # Optional values
+    fap_version="0.2",
+    fap_icon="co2_sniffer.png",  # 10x10 1-bit PNG
+    fap_description="CO2 sniffer: BMP388 + SCD30 on external I2C, framed stream (DEADFF09 hdr + CRC16) over CDC",
+    fap_author="Analog Dragon",
+    fap_icon_assets="images",  # Image assets to compile for this application
+)
