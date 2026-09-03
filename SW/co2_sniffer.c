@@ -1,4 +1,5 @@
 #include <furi.h>
+#include <furi_hal_power.h>
 #include <gui/gui.h>
 #include <input/input.h>
 #include <math.h>
@@ -102,6 +103,7 @@ typedef struct {
     uint8_t style;
     uint8_t time_scale;
     bool clear_confirm;
+    bool exit_confirm;
     bool history_reset_requested;
     bool backlight_always_on;
 
@@ -612,6 +614,17 @@ static void co2_draw_fault(Canvas* canvas, bool bmp_ok, bool scd_ok) {
     }
 }
 
+static void co2_draw_battery_percent(Canvas* canvas) {
+    char text[6];
+    snprintf(text, sizeof(text), "%u%%", (unsigned int)furi_hal_power_get_pct());
+    canvas_set_font(canvas, FontSecondary);
+    uint16_t width = canvas_string_width(canvas, text);
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_box(canvas, 126 - width, 0, width + 2, 9);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_str_aligned(canvas, 127, 7, AlignRight, AlignBottom, text);
+}
+
 static void co2_draw_clear_confirm(Canvas* canvas) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str_aligned(canvas, 64, 19, AlignCenter, AlignBottom, "Clear all curves?");
@@ -620,9 +633,17 @@ static void co2_draw_clear_confirm(Canvas* canvas) {
     canvas_draw_str_aligned(canvas, 64, 57, AlignCenter, AlignBottom, "BACK: cancel   OK: clear");
 }
 
+static void co2_draw_exit_confirm(Canvas* canvas) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 22, AlignCenter, AlignBottom, "Exit CO2-Sniffer?");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 55, AlignCenter, AlignBottom, "BACK: cancel   OK: exit");
+}
+
 static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
     Co2SnifferApp* app = ctx;
     bool clear_confirm;
+    bool exit_confirm;
     bool home_done;
     bool bmp_ok;
     bool scd_ok;
@@ -637,6 +658,7 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
 
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
     clear_confirm = app->clear_confirm;
+    exit_confirm = app->exit_confirm;
     home_done = app->home_done;
     bmp_ok = app->bmp_ok;
     scd_ok = app->scd_ok;
@@ -652,6 +674,10 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
 
     canvas_clear(canvas);
     canvas_set_color(canvas, ColorBlack);
+    if(exit_confirm) {
+        co2_draw_exit_confirm(canvas);
+        return;
+    }
     if(clear_confirm) {
         co2_draw_clear_confirm(canvas);
         return;
@@ -694,6 +720,7 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
         co2_draw_graph(canvas, app, metric, valid, current);
     }
     co2_draw_fault(canvas, bmp_ok, scd_ok);
+    if(page == 0) co2_draw_battery_percent(canvas);
 }
 
 static void co2_clear_history_locked(Co2SnifferApp* app) {
@@ -709,14 +736,25 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
     Co2SnifferApp* app = ctx;
 
     if(event->key == InputKeyBack && event->type == InputTypeLong) {
-        app->running = false;
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        app->clear_confirm = false;
+        app->exit_confirm = true;
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
         return;
     }
     if(event->key == InputKeyOk && event->type == InputTypeLong) {
         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
-        app->backlight_always_on = !app->backlight_always_on;
+        bool exit_confirm = app->exit_confirm;
         bool enabled = app->backlight_always_on;
+        if(exit_confirm) {
+            app->exit_confirm = false;
+            app->running = false;
+        } else {
+            app->backlight_always_on = !app->backlight_always_on;
+            enabled = app->backlight_always_on;
+        }
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        if(exit_confirm) return;
         if(enabled)
             notification_message(app->notifications, &co2_backlight_enable_sequence);
         else
@@ -727,13 +765,19 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
 
     if(event->key == InputKeyBack && event->type == InputTypeShort) {
         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
-        app->clear_confirm = !app->clear_confirm;
+        if(app->exit_confirm)
+            app->exit_confirm = false;
+        else
+            app->clear_confirm = !app->clear_confirm;
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
         return;
     }
     if(event->key == InputKeyOk && event->type == InputTypeShort) {
         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
-        if(app->clear_confirm) {
+        if(app->exit_confirm) {
+            app->exit_confirm = false;
+            app->running = false;
+        } else if(app->clear_confirm) {
             co2_clear_history_locked(app);
             app->clear_confirm = false;
         }
@@ -742,7 +786,7 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
     }
 
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
-    if(app->home_done && !app->clear_confirm) {
+    if(app->home_done && !app->clear_confirm && !app->exit_confirm) {
         if(event->key == InputKeyRight) {
             app->page = (app->page + 1) % CO2_PAGE_COUNT;
         } else if(event->key == InputKeyLeft) {
