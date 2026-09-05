@@ -36,8 +36,8 @@
 #define CO2_SCD_WARMUP_MS 10000
 #define CO2_ALTITUDE_FILTER_ALPHA 0.2f
 #define CO2_RECORD_INTERVAL_COUNT 5
-#define CO2_RECORD_DURATION_COUNT 6
-#define CO2_RECORD_CONTINUOUS 5
+#define CO2_RECORD_DURATION_COUNT 9
+#define CO2_RECORD_CONTINUOUS 8
 #define CO2_RECORD_DIRECTORY EXT_PATH("co2_sniffer")
 
 typedef enum {
@@ -88,6 +88,9 @@ static const uint32_t co2_record_duration_ms[CO2_RECORD_DURATION_COUNT - 1] = {
     600000,
     1800000,
     3600000,
+    7200000,
+    28800000,
+    86400000,
 };
 
 static const char* const co2_record_duration_name[CO2_RECORD_DURATION_COUNT] = {
@@ -96,6 +99,9 @@ static const char* const co2_record_duration_name[CO2_RECORD_DURATION_COUNT] = {
     "10min",
     "30min",
     "1h",
+    "2h",
+    "8h",
+    "24h",
     "continuous",
 };
 
@@ -934,8 +940,12 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
             app->exit_confirm = false;
         else if(app->i2c_fatal) {
             /* The fatal page is latched; long BACK still opens exit confirmation. */
-        }
-        else
+        } else if(app->home_done && app->page == CO2_RECORD_PAGE) {
+            if(app->record_editing)
+                app->record_editing = false;
+            else
+                app->page = 0;
+        } else
             app->clear_confirm = !app->clear_confirm;
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
         return;
