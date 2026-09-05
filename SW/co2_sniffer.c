@@ -1,9 +1,11 @@
 #include <furi.h>
 #include <furi_hal_power.h>
+#include <furi_hal_rtc.h>
 #include <gui/gui.h>
 #include <input/input.h>
 #include <math.h>
 #include <notification/notification_messages.h>
+#include <storage/storage.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -24,7 +26,8 @@
 #define CO2_FRAME_SIZE (CO2_FRAME_HDR + CO2_FRAME_LEN + CO2_FRAME_PAYLOAD + CO2_FRAME_CRC)
 
 #define CO2_TICK_MS 333
-#define CO2_PAGE_COUNT 6
+#define CO2_DATA_PAGE_COUNT 6
+#define CO2_RECORD_PAGE CO2_DATA_PAGE_COUNT
 #define CO2_STYLE_COUNT 4
 #define CO2_TIME_SCALE_COUNT 6
 #define CO2_HISTORY_POINTS 128
@@ -32,6 +35,10 @@
 #define CO2_BMP_WARMUP_MS 5000
 #define CO2_SCD_WARMUP_MS 10000
 #define CO2_ALTITUDE_FILTER_ALPHA 0.2f
+#define CO2_RECORD_INTERVAL_COUNT 5
+#define CO2_RECORD_DURATION_COUNT 6
+#define CO2_RECORD_CONTINUOUS 5
+#define CO2_RECORD_DIRECTORY EXT_PATH("co2_sniffer")
 
 typedef enum {
     Co2MetricCo2,
@@ -57,6 +64,39 @@ static const char* const co2_time_scale_name[CO2_TIME_SCALE_COUNT] = {
     "30s",
     "1m",
     "10m",
+};
+
+static const uint32_t co2_record_interval_ms[CO2_RECORD_INTERVAL_COUNT] = {
+    2000,
+    5000,
+    10000,
+    30000,
+    60000,
+};
+
+static const char* const co2_record_interval_name[CO2_RECORD_INTERVAL_COUNT] = {
+    "2s",
+    "5s",
+    "10s",
+    "30s",
+    "1min",
+};
+
+static const uint32_t co2_record_duration_ms[CO2_RECORD_DURATION_COUNT - 1] = {
+    60000,
+    300000,
+    600000,
+    1800000,
+    3600000,
+};
+
+static const char* const co2_record_duration_name[CO2_RECORD_DURATION_COUNT] = {
+    "1min",
+    "5min",
+    "10min",
+    "30min",
+    "1h",
+    "continuous",
 };
 
 static const NotificationSequence co2_backlight_enable_sequence = {
@@ -106,6 +146,16 @@ typedef struct {
     bool exit_confirm;
     bool history_reset_requested;
     bool backlight_always_on;
+
+    uint8_t record_interval;
+    uint8_t record_duration;
+    uint8_t record_cursor;
+    bool record_editing;
+    bool record_start_requested;
+    bool record_stop_requested;
+    bool recording;
+    bool record_error;
+    bool i2c_fatal;
 
     /* Each time scale has its own 128-point ring. This preserves every graph
      * while keeping the session history below 20 KB. */
@@ -614,15 +664,99 @@ static void co2_draw_fault(Canvas* canvas, bool bmp_ok, bool scd_ok) {
     }
 }
 
-static void co2_draw_battery_percent(Canvas* canvas) {
+static bool co2_record_blink_on(void) {
+    /* A 2 second full cycle gives a 0.5 Hz REC blink. */
+    return ((furi_get_tick() / 1000U) & 1U) == 0;
+}
+
+static void co2_draw_record_badge(Canvas* canvas) {
+    if(!co2_record_blink_on()) return;
+
+    canvas_set_font(canvas, FontSecondary);
+    uint16_t width = canvas_string_width(canvas, "REC");
+    int32_t x = 64 - (int32_t)width / 2;
+    canvas_set_color(canvas, ColorWhite);
+    canvas_draw_box(canvas, x - 1, 0, width + 2, 9);
+    canvas_set_color(canvas, ColorBlack);
+    canvas_draw_str_aligned(canvas, 64, 7, AlignCenter, AlignBottom, "REC");
+}
+
+static void co2_draw_battery_percent(Canvas* canvas, bool recording) {
     char text[6];
     snprintf(text, sizeof(text), "%u%%", (unsigned int)furi_hal_power_get_pct());
     canvas_set_font(canvas, FontSecondary);
     uint16_t width = canvas_string_width(canvas, text);
+    int32_t text_left = 127 - width;
     canvas_set_color(canvas, ColorWhite);
     canvas_draw_box(canvas, 126 - width, 0, width + 2, 9);
     canvas_set_color(canvas, ColorBlack);
     canvas_draw_str_aligned(canvas, 127, 7, AlignRight, AlignBottom, text);
+
+    if(recording && co2_record_blink_on()) {
+        int32_t rec_right = text_left - canvas_glyph_width(canvas, ' ');
+        uint16_t rec_width = canvas_string_width(canvas, "REC");
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_box(canvas, rec_right - rec_width - 1, 0, rec_width + 2, 9);
+        canvas_set_color(canvas, ColorBlack);
+        canvas_draw_str_aligned(canvas, rec_right, 7, AlignRight, AlignBottom, "REC");
+    }
+}
+
+static void co2_draw_record_page(
+    Canvas* canvas,
+    uint8_t interval,
+    uint8_t duration,
+    uint8_t cursor,
+    bool editing,
+    bool recording,
+    bool error) {
+    char value[24];
+
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 9, AlignCenter, AlignBottom, "Data Recording");
+    if(error) {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, 127, 8, AlignRight, AlignBottom, "SD!");
+    }
+    canvas_draw_line(canvas, 5, 12, 122, 12);
+
+    canvas_set_font(canvas, FontSecondary);
+    if(!recording && cursor == 0) canvas_draw_str(canvas, 1, 27, ">");
+    canvas_draw_str(canvas, 9, 27, "Interval");
+    if(!recording && editing && cursor == 0)
+        snprintf(value, sizeof(value), "< %s >", co2_record_interval_name[interval]);
+    else
+        snprintf(value, sizeof(value), "%s", co2_record_interval_name[interval]);
+    canvas_draw_str_aligned(canvas, 126, 27, AlignRight, AlignBottom, value);
+
+    if(!recording && cursor == 1) canvas_draw_str(canvas, 1, 43, ">");
+    canvas_draw_str(canvas, 9, 43, "Length");
+    if(!recording && editing && cursor == 1)
+        snprintf(value, sizeof(value), "< %s >", co2_record_duration_name[duration]);
+    else
+        snprintf(value, sizeof(value), "%s", co2_record_duration_name[duration]);
+    canvas_draw_str_aligned(canvas, 126, 43, AlignRight, AlignBottom, value);
+
+    if(cursor == 2) canvas_draw_str(canvas, 1, 60, ">");
+    canvas_set_font(canvas, FontPrimary);
+    if(recording) {
+        uint16_t width = canvas_string_width(canvas, "Stop");
+        canvas_draw_box(canvas, 68 - width / 2 - 3, 48, width + 6, 15);
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_str_aligned(canvas, 68, 61, AlignCenter, AlignBottom, "Stop");
+        canvas_set_color(canvas, ColorBlack);
+    } else {
+        canvas_draw_str_aligned(canvas, 68, 61, AlignCenter, AlignBottom, "Start");
+    }
+}
+
+static void co2_draw_i2c_error(Canvas* canvas) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 13, AlignCenter, AlignBottom, "I2C BUS ERROR");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 31, AlignCenter, AlignBottom, "Bus reset failed");
+    canvas_draw_str_aligned(canvas, 64, 47, AlignCenter, AlignBottom, "Restart Flipper");
+    canvas_draw_str_aligned(canvas, 64, 61, AlignCenter, AlignBottom, "to use sensors");
 }
 
 static void co2_draw_clear_confirm(Canvas* canvas) {
@@ -655,6 +789,13 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
     float humidity;
     uint8_t page;
     uint8_t style;
+    uint8_t record_interval;
+    uint8_t record_duration;
+    uint8_t record_cursor;
+    bool record_editing;
+    bool recording;
+    bool record_error;
+    bool i2c_fatal;
 
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
     clear_confirm = app->clear_confirm;
@@ -670,6 +811,13 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
     humidity = app->R_SCD;
     page = app->page;
     style = app->style;
+    record_interval = app->record_interval;
+    record_duration = app->record_duration;
+    record_cursor = app->record_cursor;
+    record_editing = app->record_editing;
+    recording = app->recording;
+    record_error = app->record_error;
+    i2c_fatal = app->i2c_fatal;
     furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
 
     canvas_clear(canvas);
@@ -682,12 +830,26 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
         co2_draw_clear_confirm(canvas);
         return;
     }
+    if(i2c_fatal) {
+        co2_draw_i2c_error(canvas);
+        return;
+    }
     if(!home_done) {
         co2_draw_home(canvas, app);
         return;
     }
 
-    if(page == 0) {
+    if(page == CO2_RECORD_PAGE) {
+        co2_draw_record_page(
+            canvas,
+            record_interval,
+            record_duration,
+            record_cursor,
+            record_editing,
+            recording,
+            record_error);
+        return;
+    } else if(page == 0) {
         if(style == 0)
             co2_draw_full_page(
                 canvas, bmp_ok, scd_ok, t_bmp, pressure, altitude, co2, t_scd, humidity);
@@ -720,7 +882,10 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
         co2_draw_graph(canvas, app, metric, valid, current);
     }
     co2_draw_fault(canvas, bmp_ok, scd_ok);
-    if(page == 0) co2_draw_battery_percent(canvas);
+    if(page == 0)
+        co2_draw_battery_percent(canvas, recording);
+    else if(recording)
+        co2_draw_record_badge(canvas);
 }
 
 static void co2_clear_history_locked(Co2SnifferApp* app) {
@@ -767,6 +932,9 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
         if(app->exit_confirm)
             app->exit_confirm = false;
+        else if(app->i2c_fatal) {
+            /* The fatal page is latched; long BACK still opens exit confirmation. */
+        }
         else
             app->clear_confirm = !app->clear_confirm;
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
@@ -780,17 +948,56 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
         } else if(app->clear_confirm) {
             co2_clear_history_locked(app);
             app->clear_confirm = false;
+        } else if(app->home_done && app->page == CO2_RECORD_PAGE) {
+            if(app->recording) {
+                app->record_stop_requested = true;
+            } else if(app->record_cursor == 2) {
+                app->record_start_requested = true;
+                app->record_error = false;
+                app->record_editing = false;
+            } else {
+                app->record_editing = !app->record_editing;
+            }
         }
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
         return;
     }
 
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
-    if(app->home_done && !app->clear_confirm && !app->exit_confirm) {
-        if(event->key == InputKeyRight) {
-            app->page = (app->page + 1) % CO2_PAGE_COUNT;
+    if(app->home_done && !app->clear_confirm && !app->exit_confirm && !app->i2c_fatal) {
+        if(app->page == CO2_RECORD_PAGE) {
+            if(event->key == InputKeyRight) {
+                if(app->record_editing && !app->recording) {
+                    if(app->record_cursor == 0)
+                        app->record_interval =
+                            (app->record_interval + 1) % CO2_RECORD_INTERVAL_COUNT;
+                    else if(app->record_cursor == 1)
+                        app->record_duration =
+                            (app->record_duration + 1) % CO2_RECORD_DURATION_COUNT;
+                } else {
+                    app->page = 0;
+                }
+            } else if(event->key == InputKeyLeft && app->record_editing && !app->recording) {
+                if(app->record_cursor == 0)
+                    app->record_interval =
+                        (app->record_interval + CO2_RECORD_INTERVAL_COUNT - 1) %
+                        CO2_RECORD_INTERVAL_COUNT;
+                else if(app->record_cursor == 1)
+                    app->record_duration =
+                        (app->record_duration + CO2_RECORD_DURATION_COUNT - 1) %
+                        CO2_RECORD_DURATION_COUNT;
+            } else if(event->key == InputKeyUp && !app->record_editing && !app->recording) {
+                app->record_cursor = (app->record_cursor + 2) % 3;
+            } else if(event->key == InputKeyDown && !app->record_editing && !app->recording) {
+                app->record_cursor = (app->record_cursor + 1) % 3;
+            }
+        } else if(event->key == InputKeyRight) {
+            app->page = (app->page + 1) % CO2_DATA_PAGE_COUNT;
         } else if(event->key == InputKeyLeft) {
-            app->page = (app->page + CO2_PAGE_COUNT - 1) % CO2_PAGE_COUNT;
+            if(app->page == 0)
+                app->page = CO2_RECORD_PAGE;
+            else
+                app->page--;
         } else if(event->key == InputKeyUp) {
             if(app->page == 0)
                 app->style = (app->style + CO2_STYLE_COUNT - 1) % CO2_STYLE_COUNT;
@@ -859,6 +1066,140 @@ static void co2_update_home_state(Co2SnifferApp* app, uint32_t now) {
     }
 }
 
+static void co2_record_close(File* file) {
+    if(storage_file_is_open(file)) {
+        storage_file_sync(file);
+        storage_file_close(file);
+    }
+}
+
+static bool co2_record_open(
+    Storage* storage,
+    File* file,
+    uint8_t interval,
+    uint8_t duration) {
+    FS_Error mkdir_error = storage_common_mkdir(storage, CO2_RECORD_DIRECTORY);
+    if(mkdir_error != FSE_OK && mkdir_error != FSE_EXIST) return false;
+
+    DateTime datetime;
+    furi_hal_rtc_get_datetime(&datetime);
+    char path[128];
+    bool opened = false;
+    for(uint8_t suffix = 0; suffix < 100; suffix++) {
+        if(suffix == 0) {
+            snprintf(
+                path,
+                sizeof(path),
+                CO2_RECORD_DIRECTORY "/%04u%02u%02u_%02u%02u%02u_%s_%s.csv",
+                datetime.year,
+                datetime.month,
+                datetime.day,
+                datetime.hour,
+                datetime.minute,
+                datetime.second,
+                co2_record_interval_name[interval],
+                co2_record_duration_name[duration]);
+        } else {
+            snprintf(
+                path,
+                sizeof(path),
+                CO2_RECORD_DIRECTORY "/%04u%02u%02u_%02u%02u%02u_%s_%s_%02u.csv",
+                datetime.year,
+                datetime.month,
+                datetime.day,
+                datetime.hour,
+                datetime.minute,
+                datetime.second,
+                co2_record_interval_name[interval],
+                co2_record_duration_name[duration],
+                suffix);
+        }
+        if(storage_file_open(file, path, FSAM_WRITE, FSOM_CREATE_NEW)) {
+            opened = true;
+            break;
+        }
+        FS_Error open_error = storage_file_get_error(file);
+        storage_file_close(file);
+        if(open_error != FSE_EXIST) return false;
+    }
+    if(!opened) return false;
+
+    static const char header[] =
+        "timestamp,elapsed_s,co2_ppm,scd30_temperature_c,humidity_pct,"
+        "bmp388_temperature_c,pressure_hpa,altitude_m\n";
+    if(storage_file_write(file, header, sizeof(header) - 1) != sizeof(header) - 1 ||
+       !storage_file_sync(file)) {
+        co2_record_close(file);
+        return false;
+    }
+    return true;
+}
+
+static bool co2_record_write(
+    File* file,
+    uint32_t elapsed_ms,
+    bool bmp_valid,
+    bool scd_valid,
+    float bmp_temperature,
+    float pressure_pa,
+    float altitude,
+    float co2,
+    float scd_temperature,
+    float humidity) {
+    DateTime datetime;
+    furi_hal_rtc_get_datetime(&datetime);
+
+    char co2_text[16] = "";
+    char scd_temperature_text[16] = "";
+    char humidity_text[16] = "";
+    char bmp_temperature_text[16] = "";
+    char pressure_text[16] = "";
+    char altitude_text[16] = "";
+    if(scd_valid) {
+        snprintf(co2_text, sizeof(co2_text), "%.0f", (double)co2);
+        snprintf(scd_temperature_text, sizeof(scd_temperature_text), "%.2f", (double)scd_temperature);
+        snprintf(humidity_text, sizeof(humidity_text), "%.2f", (double)humidity);
+    }
+    if(bmp_valid) {
+        snprintf(bmp_temperature_text, sizeof(bmp_temperature_text), "%.2f", (double)bmp_temperature);
+        snprintf(pressure_text, sizeof(pressure_text), "%.2f", (double)(pressure_pa / 100.0f));
+        snprintf(altitude_text, sizeof(altitude_text), "%.1f", (double)altitude);
+    }
+
+    char line[192];
+    int length = snprintf(
+        line,
+        sizeof(line),
+        "%04u-%02u-%02u %02u:%02u:%02u,%lu,%s,%s,%s,%s,%s,%s\n",
+        datetime.year,
+        datetime.month,
+        datetime.day,
+        datetime.hour,
+        datetime.minute,
+        datetime.second,
+        (unsigned long)(elapsed_ms / 1000U),
+        co2_text,
+        scd_temperature_text,
+        humidity_text,
+        bmp_temperature_text,
+        pressure_text,
+        altitude_text);
+    if(length <= 0 || (size_t)length >= sizeof(line)) return false;
+    return storage_file_write(file, line, (size_t)length) == (size_t)length &&
+           storage_file_sync(file);
+}
+
+static void co2_record_set_state(Co2SnifferApp* app, bool recording, bool error) {
+    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+    app->recording = recording;
+    app->record_error = error;
+    if(recording) {
+        app->record_cursor = 2;
+        app->record_editing = false;
+    }
+    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+}
+
 static int32_t co2_sniffer_worker(void* ctx) {
     Co2SnifferApp* app = ctx;
     uint8_t frame[CO2_FRAME_SIZE];
@@ -874,6 +1215,15 @@ static int32_t co2_sniffer_worker(void* ctx) {
     bool history_started = false;
     bool altitude_filter_valid = false;
     float altitude_filtered = 0.0f;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* record_file = storage_file_alloc(storage);
+    bool file_recording = false;
+    uint8_t active_record_interval = 0;
+    uint8_t active_record_duration = 0;
+    uint32_t record_started_at = 0;
+    uint32_t next_record_at = 0;
+    uint32_t record_stops_at = 0;
+    bool i2c_fatal = false;
 
     uint32_t now = furi_get_tick();
     for(uint8_t scale = 0; scale < CO2_TIME_SCALE_COUNT; scale++) {
@@ -940,6 +1290,18 @@ static int32_t co2_sniffer_worker(void* ctx) {
                     scd_has_measurement = false;
                 }
             }
+        }
+
+        if(!co2_i2c_recover()) {
+            i2c_fatal = true;
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            app->i2c_fatal = true;
+            app->clear_confirm = false;
+            app->recording = false;
+            app->record_start_requested = false;
+            app->record_stop_requested = false;
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+            break;
         }
 
         frame[0] = 0xDE;
@@ -1026,14 +1388,73 @@ static int32_t co2_sniffer_worker(void* ctx) {
                 }
             }
         }
+        bool start_record = app->record_start_requested;
+        bool stop_record = app->record_stop_requested;
+        uint8_t requested_interval = app->record_interval;
+        uint8_t requested_duration = app->record_duration;
+        app->record_start_requested = false;
+        app->record_stop_requested = false;
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+
+        if(stop_record && file_recording) {
+            co2_record_close(record_file);
+            file_recording = false;
+            co2_record_set_state(app, false, false);
+        }
+
+        if(start_record && !file_recording) {
+            if(co2_record_open(storage, record_file, requested_interval, requested_duration)) {
+                file_recording = true;
+                active_record_interval = requested_interval;
+                active_record_duration = requested_duration;
+                record_started_at = now;
+                next_record_at = now;
+                if(active_record_duration != CO2_RECORD_CONTINUOUS) {
+                    record_stops_at = now + co2_record_duration_ms[active_record_duration];
+                }
+                co2_record_set_state(app, true, false);
+            } else {
+                co2_record_set_state(app, false, true);
+            }
+        }
+
+        if(file_recording && active_record_duration != CO2_RECORD_CONTINUOUS &&
+           co2_time_reached(now, record_stops_at)) {
+            co2_record_close(record_file);
+            file_recording = false;
+            co2_record_set_state(app, false, false);
+        }
+
+        if(file_recording && co2_time_reached(now, next_record_at)) {
+            bool write_ok = co2_record_write(
+                record_file,
+                now - record_started_at,
+                bmp_usable,
+                scd_usable,
+                app->bmp.T_LIN,
+                app->bmp.P_LIN,
+                altitude_filtered,
+                app->scd.CO2_PPM,
+                app->scd.T_SCD,
+                app->scd.R_SCD);
+            if(write_ok) {
+                next_record_at = now + co2_record_interval_ms[active_record_interval];
+            } else {
+                co2_record_close(record_file);
+                file_recording = false;
+                co2_record_set_state(app, false, true);
+            }
+        }
 
         furi_delay_ms(CO2_TICK_MS);
     }
 
-    co2_scd30_stop();
+    if(!i2c_fatal) co2_scd30_stop();
     co2_usb_stream_stop();
     co2_i2c_release();
+    co2_record_close(record_file);
+    storage_file_free(record_file);
+    furi_record_close(RECORD_STORAGE);
     return 0;
 }
 
@@ -1055,7 +1476,7 @@ int32_t co2_sniffer_app(void* p) {
     view_port_input_callback_set(app->view_port, co2_sniffer_input_cb, app);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
 
-    app->worker = furi_thread_alloc_ex("Co2Sniffer", 3072, co2_sniffer_worker, app);
+    app->worker = furi_thread_alloc_ex("Co2Sniffer", 4096, co2_sniffer_worker, app);
     furi_thread_start(app->worker);
 
     while(app->running) {

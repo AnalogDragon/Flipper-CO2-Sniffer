@@ -22,6 +22,11 @@ typedef struct {
 void co2_i2c_acquire(void);
 void co2_i2c_release(void);
 
+/** Reset the external I2C peripheral if it is stuck or has a hardware error.
+ * Returns false only when the error remains after the reset. A normal device
+ * NACK is not treated as a bus failure. */
+bool co2_i2c_recover(void);
+
 /** Scan the external I2C bus for responding devices (debug helper). */
 void co2_i2c_scan(Co2I2cScanResult* result);
 

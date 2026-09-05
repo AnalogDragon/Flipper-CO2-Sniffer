@@ -16,6 +16,23 @@ void co2_i2c_release(void) {
     furi_hal_i2c_release(&furi_hal_i2c_handle_external);
 }
 
+static bool co2_i2c_has_hardware_error(void) {
+    I2C_TypeDef* i2c = furi_hal_i2c_bus_external.i2c;
+    return LL_I2C_IsActiveFlag_BUSY(i2c) || LL_I2C_IsActiveFlag_BERR(i2c) ||
+           LL_I2C_IsActiveFlag_ARLO(i2c) || LL_I2C_IsActiveFlag_OVR(i2c);
+}
+
+bool co2_i2c_recover(void) {
+    if(!co2_i2c_has_hardware_error()) return true;
+
+    /* Releasing the last handle resets I2C3 and floats its pins. Reacquiring
+     * it performs the same peripheral reset available to an application. */
+    co2_i2c_release();
+    furi_delay_ms(5);
+    co2_i2c_acquire();
+    return !co2_i2c_has_hardware_error();
+}
+
 /* IMPORTANT: this firmware's furi_hal_i2c API expects the address in 8-bit
  * form (7-bit addr << 1). Verified by disassembling the SDK: the driver ORs
  * the address into CR2.SADD without shifting. Passing a raw 7-bit address
