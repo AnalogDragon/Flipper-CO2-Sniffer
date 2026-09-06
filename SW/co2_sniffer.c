@@ -28,17 +28,23 @@
 #define CO2_TICK_MS 333
 #define CO2_DATA_PAGE_COUNT 6
 #define CO2_RECORD_PAGE CO2_DATA_PAGE_COUNT
+#define CO2_SCD_SETTINGS_PAGE (CO2_RECORD_PAGE + 1)
+#define CO2_SCD_CAL_INFO_PAGE (CO2_RECORD_PAGE + 2)
+#define CO2_SCD_CAL_PAGE (CO2_RECORD_PAGE + 3)
 #define CO2_STYLE_COUNT 4
 #define CO2_TIME_SCALE_COUNT 6
 #define CO2_HISTORY_POINTS 128
 #define CO2_METRIC_COUNT 5
-#define CO2_BMP_WARMUP_MS 5000
+#define CO2_BMP_WARMUP_MS 10000
 #define CO2_SCD_WARMUP_MS 10000
 #define CO2_ALTITUDE_FILTER_ALPHA 0.2f
 #define CO2_RECORD_INTERVAL_COUNT 5
 #define CO2_RECORD_DURATION_COUNT 9
 #define CO2_RECORD_CONTINUOUS 8
 #define CO2_RECORD_DIRECTORY EXT_PATH("co2_sniffer")
+#define CO2_SETTINGS_PATH CO2_RECORD_DIRECTORY "/settings.bin"
+#define CO2_HOLD_ACTION_MS 2000
+#define CO2_FRC_DEFAULT_PPM 420
 
 typedef enum {
     Co2MetricCo2,
@@ -47,6 +53,13 @@ typedef enum {
     Co2MetricPressure,
     Co2MetricAltitude,
 } Co2Metric;
+
+typedef enum {
+    Co2FrcResultNone,
+    Co2FrcResultSuccess,
+    Co2FrcResultFailure,
+    Co2FrcResultInvalid,
+} Co2FrcResult;
 
 static const uint32_t co2_time_scale_ms[CO2_TIME_SCALE_COUNT] = {
     2000,
@@ -163,6 +176,28 @@ typedef struct {
     bool record_error;
     bool i2c_fatal;
 
+    bool scd_pressure_compensation;
+    bool scd_asc_enabled;
+    bool scd_settings_save_requested;
+    bool scd_settings_apply_requested;
+    bool scd_settings_save_error;
+    uint8_t scd_settings_cursor;
+
+    uint16_t frc_reference_ppm;
+    uint8_t frc_digit_cursor;
+    uint32_t frc_started_at;
+    bool frc_confirm;
+    bool frc_requested;
+    bool frc_pending;
+    Co2FrcResult frc_result;
+
+    bool left_hold_active;
+    bool left_hold_consumed;
+    uint32_t left_hold_started_at;
+    bool ok_hold_active;
+    bool ok_hold_consumed;
+    uint32_t ok_hold_started_at;
+
     /* Each time scale has its own 128-point ring. This preserves every graph
      * while keeping the session history below 20 KB. */
     float history[CO2_TIME_SCALE_COUNT][CO2_METRIC_COUNT][CO2_HISTORY_POINTS];
@@ -182,6 +217,48 @@ typedef struct {
 
 static bool co2_time_reached(uint32_t now, uint32_t deadline) {
     return (int32_t)(now - deadline) >= 0;
+}
+
+static uint8_t co2_settings_checksum(const uint8_t* data, size_t length) {
+    uint8_t checksum = 0xA5;
+    for(size_t i = 0; i < length; i++) checksum ^= data[i];
+    return checksum;
+}
+
+static bool co2_settings_save(Storage* storage, bool pressure_compensation, bool asc_enabled) {
+    FS_Error mkdir_error = storage_common_mkdir(storage, CO2_RECORD_DIRECTORY);
+    if(mkdir_error != FSE_OK && mkdir_error != FSE_EXIST) return false;
+
+    uint8_t data[8] = {'C', '2', 'S', 'C', 1, 0, 0, 0};
+    if(pressure_compensation) data[5] |= 1U;
+    if(asc_enabled) data[5] |= 2U;
+    data[7] = co2_settings_checksum(data, 7);
+
+    File* file = storage_file_alloc(storage);
+    bool opened = storage_file_open(file, CO2_SETTINGS_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    bool saved = opened && storage_file_write(file, data, sizeof(data)) == sizeof(data) &&
+                 storage_file_sync(file);
+    storage_file_close(file);
+    storage_file_free(file);
+    return saved;
+}
+
+static bool co2_settings_load(Storage* storage, bool* pressure_compensation, bool* asc_enabled) {
+    uint8_t data[8];
+    File* file = storage_file_alloc(storage);
+    bool opened = storage_file_open(file, CO2_SETTINGS_PATH, FSAM_READ, FSOM_OPEN_EXISTING);
+    bool loaded = opened && storage_file_size(file) == sizeof(data) &&
+                  storage_file_read(file, data, sizeof(data)) == sizeof(data);
+    storage_file_close(file);
+    storage_file_free(file);
+
+    loaded = loaded && memcmp(data, "C2SC", 4) == 0 && data[4] == 1 &&
+             data[7] == co2_settings_checksum(data, 7) && !(data[5] & ~3U);
+    if(loaded) {
+        *pressure_compensation = data[5] & 1U;
+        *asc_enabled = data[5] & 2U;
+    }
+    return loaded;
 }
 
 static float co2_pressure_to_altitude(float pressure_pa) {
@@ -756,6 +833,135 @@ static void co2_draw_record_page(
     }
 }
 
+static void co2_draw_scd_settings_page(
+    Canvas* canvas,
+    uint8_t cursor,
+    bool pressure_compensation,
+    bool asc_enabled,
+    bool save_error) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 9, AlignCenter, AlignBottom, "SCD30 Calibration");
+    canvas_draw_line(canvas, 5, 12, 122, 12);
+
+    canvas_set_font(canvas, FontSecondary);
+    if(cursor == 0) canvas_draw_str(canvas, 1, 27, ">");
+    canvas_draw_str(canvas, 9, 27, "Pressure comp");
+    canvas_draw_str_aligned(canvas, 126, 27, AlignRight, AlignBottom, pressure_compensation ? "ON" : "OFF");
+
+    if(cursor == 1) canvas_draw_str(canvas, 1, 43, ">");
+    canvas_draw_str(canvas, 9, 43, "Auto calib (ASC)");
+    canvas_draw_str_aligned(canvas, 126, 43, AlignRight, AlignBottom, asc_enabled ? "ON" : "OFF");
+
+    if(cursor == 2) canvas_draw_str(canvas, 1, 59, ">");
+    canvas_draw_str(canvas, 9, 59, "Manual calibration");
+    canvas_draw_str_aligned(canvas, 126, 59, AlignRight, AlignBottom, ">");
+    if(save_error) canvas_draw_str_aligned(canvas, 126, 9, AlignRight, AlignBottom, "SD!");
+}
+
+static void co2_draw_emphasis_line(
+    Canvas* canvas,
+    int32_t y,
+    const char* before,
+    const char* emphasized,
+    const char* after) {
+    canvas_set_font(canvas, FontSecondary);
+    uint16_t before_width = canvas_string_width(canvas, before);
+    uint16_t after_width = canvas_string_width(canvas, after);
+    canvas_set_font(canvas, FontPrimary);
+    uint16_t emphasized_width = canvas_string_width(canvas, emphasized);
+    int32_t x = 64 - (before_width + emphasized_width + after_width) / 2;
+
+    canvas_set_font(canvas, FontSecondary);
+    x = co2_draw_text(canvas, x, y, before);
+    canvas_set_font(canvas, FontPrimary);
+    x = co2_draw_text(canvas, x, y, emphasized);
+    canvas_set_font(canvas, FontSecondary);
+    co2_draw_text(canvas, x, y, after);
+}
+
+static void co2_draw_scd_cal_info(Canvas* canvas) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 9, AlignCenter, AlignBottom, "Manual Calibration");
+    co2_draw_emphasis_line(canvas, 21, "Use ", "stable", " reference air");
+    co2_draw_emphasis_line(canvas, 32, "Keep ", "face", " away");
+    co2_draw_emphasis_line(canvas, 43, "Keep powered for ", "2 min", "");
+    co2_draw_emphasis_line(canvas, 53, "Range: ", "0400-2000", " ppm");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "BACK: cancel   OK: set");
+}
+
+static void co2_draw_scd_cal_page(
+    Canvas* canvas,
+    uint16_t reference_ppm,
+    uint8_t digit_cursor,
+    uint32_t started_at,
+    bool confirm,
+    bool pending,
+    Co2FrcResult result,
+    bool ok_hold_active,
+    uint32_t ok_hold_started_at) {
+    uint32_t now = furi_get_tick();
+    uint32_t elapsed_s = (now - started_at) / 1000U;
+    char text[24];
+    snprintf(
+        text,
+        sizeof(text),
+        "CAL %02lu:%02lu",
+        (unsigned long)(elapsed_s / 60U),
+        (unsigned long)(elapsed_s % 60U));
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str_aligned(canvas, 64, 10, AlignCenter, AlignBottom, text);
+
+    if(pending) {
+        canvas_set_font(canvas, FontPrimary);
+        canvas_draw_str_aligned(canvas, 64, 31, AlignCenter, AlignBottom, "Calibrating...");
+        co2_draw_emphasis_line(canvas, 47, "Keep ", "face", " away");
+        co2_draw_emphasis_line(canvas, 60, "Please keep air ", "stable", "");
+        return;
+    }
+
+    if(confirm) {
+        snprintf(text, sizeof(text), "%04u", reference_ppm);
+        co2_draw_emphasis_line(canvas, 27, "Calibrate to ", text, " ppm?");
+        co2_draw_emphasis_line(canvas, 39, "Keep ", "face", " away");
+        canvas_draw_frame(canvas, 19, 44, 90, 9);
+        uint32_t held_ms = ok_hold_active ? now - ok_hold_started_at : 0;
+        if(held_ms > CO2_HOLD_ACTION_MS) held_ms = CO2_HOLD_ACTION_MS;
+        size_t width = (size_t)(86U * held_ms / CO2_HOLD_ACTION_MS);
+        if(width > 0) canvas_draw_box(canvas, 21, 46, width, 5);
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, 64, 63, AlignCenter, AlignBottom, "Hold OK 2s   BACK: cancel");
+        return;
+    }
+
+    char digits[6];
+    snprintf(digits, sizeof(digits), "%04u", reference_ppm);
+    canvas_set_font(canvas, FontBigNumbers);
+    uint16_t total_width = canvas_string_width(canvas, digits);
+    int32_t start_x = 64 - total_width / 2;
+    canvas_draw_str(canvas, start_x, 30, digits);
+    char prefix[5];
+    memcpy(prefix, digits, digit_cursor + 1);
+    prefix[digit_cursor + 1] = '\0';
+    char selected[2] = {digits[digit_cursor], '\0'};
+    uint16_t prefix_width = canvas_string_width(canvas, prefix);
+    uint16_t selected_width = canvas_string_width(canvas, selected);
+    int32_t digit_x = start_x + prefix_width - selected_width;
+    canvas_draw_line(canvas, digit_x, 33, start_x + prefix_width - 1, 33);
+
+    co2_draw_emphasis_line(canvas, 49, "Keep ", "face", " away");
+    if(result == Co2FrcResultSuccess)
+        co2_draw_emphasis_line(canvas, 61, "Calibration ", "saved", "");
+    else if(result == Co2FrcResultFailure)
+        co2_draw_emphasis_line(canvas, 61, "Calibration ", "failed", "");
+    else if(result == Co2FrcResultInvalid)
+        co2_draw_emphasis_line(canvas, 61, "Valid range: ", "0400-2000", "");
+    else {
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str_aligned(canvas, 64, 61, AlignCenter, AlignBottom, "Arrows: edit   OK: confirm");
+    }
+}
+
 static void co2_draw_i2c_error(Canvas* canvas) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str_aligned(canvas, 64, 13, AlignCenter, AlignBottom, "I2C BUS ERROR");
@@ -802,6 +1008,18 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
     bool recording;
     bool record_error;
     bool i2c_fatal;
+    bool scd_pressure_compensation;
+    bool scd_asc_enabled;
+    bool scd_settings_save_error;
+    uint8_t scd_settings_cursor;
+    uint16_t frc_reference_ppm;
+    uint8_t frc_digit_cursor;
+    uint32_t frc_started_at;
+    bool frc_confirm;
+    bool frc_pending;
+    Co2FrcResult frc_result;
+    bool ok_hold_active;
+    uint32_t ok_hold_started_at;
 
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
     clear_confirm = app->clear_confirm;
@@ -824,6 +1042,18 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
     recording = app->recording;
     record_error = app->record_error;
     i2c_fatal = app->i2c_fatal;
+    scd_pressure_compensation = app->scd_pressure_compensation;
+    scd_asc_enabled = app->scd_asc_enabled;
+    scd_settings_save_error = app->scd_settings_save_error;
+    scd_settings_cursor = app->scd_settings_cursor;
+    frc_reference_ppm = app->frc_reference_ppm;
+    frc_digit_cursor = app->frc_digit_cursor;
+    frc_started_at = app->frc_started_at;
+    frc_confirm = app->frc_confirm;
+    frc_pending = app->frc_pending;
+    frc_result = app->frc_result;
+    ok_hold_active = app->ok_hold_active;
+    ok_hold_started_at = app->ok_hold_started_at;
     furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
 
     canvas_clear(canvas);
@@ -854,6 +1084,29 @@ static void co2_sniffer_draw_cb(Canvas* canvas, void* ctx) {
             record_editing,
             recording,
             record_error);
+        return;
+    } else if(page == CO2_SCD_SETTINGS_PAGE) {
+        co2_draw_scd_settings_page(
+            canvas,
+            scd_settings_cursor,
+            scd_pressure_compensation,
+            scd_asc_enabled,
+            scd_settings_save_error);
+        return;
+    } else if(page == CO2_SCD_CAL_INFO_PAGE) {
+        co2_draw_scd_cal_info(canvas);
+        return;
+    } else if(page == CO2_SCD_CAL_PAGE) {
+        co2_draw_scd_cal_page(
+            canvas,
+            frc_reference_ppm,
+            frc_digit_cursor,
+            frc_started_at,
+            frc_confirm,
+            frc_pending,
+            frc_result,
+            ok_hold_active,
+            ok_hold_started_at);
         return;
     } else if(page == 0) {
         if(style == 0)
@@ -903,21 +1156,97 @@ static void co2_clear_history_locked(Co2SnifferApp* app) {
     app->history_reset_requested = true;
 }
 
+static bool co2_frc_reference_valid(uint16_t reference_ppm) {
+    return reference_ppm >= 400 && reference_ppm <= 2000;
+}
+
+static uint16_t co2_frc_adjust_digit(uint16_t value, uint8_t cursor, bool increase) {
+    static const uint16_t place[4] = {1000, 100, 10, 1};
+    uint16_t digit = (value / place[cursor]) % 10U;
+    uint16_t replacement = increase ? (digit + 1U) % 10U : (digit + 9U) % 10U;
+    return value - digit * place[cursor] + replacement * place[cursor];
+}
+
+static void co2_process_hold_actions(Co2SnifferApp* app) {
+    uint32_t now = furi_get_tick();
+    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+    if(app->left_hold_active && !app->left_hold_consumed &&
+       now - app->left_hold_started_at >= CO2_HOLD_ACTION_MS) {
+        if(app->home_done && app->page == CO2_RECORD_PAGE && !app->record_editing) {
+            app->page = CO2_SCD_SETTINGS_PAGE;
+            app->scd_settings_cursor = 0;
+            app->left_hold_consumed = true;
+            app->left_hold_active = false;
+        }
+    }
+    if(app->ok_hold_active && !app->ok_hold_consumed &&
+       now - app->ok_hold_started_at >= CO2_HOLD_ACTION_MS) {
+        if(app->page == CO2_SCD_CAL_PAGE && app->frc_confirm &&
+           co2_frc_reference_valid(app->frc_reference_ppm)) {
+            app->frc_requested = true;
+            app->frc_pending = true;
+            app->frc_confirm = false;
+            app->frc_result = Co2FrcResultNone;
+            app->ok_hold_consumed = true;
+            app->ok_hold_active = false;
+        }
+    }
+    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+}
+
 static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
     Co2SnifferApp* app = ctx;
+
+    if(event->type == InputTypePress) {
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        if(event->key == InputKeyLeft && app->home_done && app->page == CO2_RECORD_PAGE &&
+           !app->record_editing) {
+            app->left_hold_active = true;
+            app->left_hold_consumed = false;
+            app->left_hold_started_at = furi_get_tick();
+        } else if(event->key == InputKeyOk && app->page == CO2_SCD_CAL_PAGE &&
+                  app->frc_confirm && !app->frc_pending &&
+                  co2_frc_reference_valid(app->frc_reference_ppm)) {
+            app->ok_hold_active = true;
+            app->ok_hold_consumed = false;
+            app->ok_hold_started_at = furi_get_tick();
+        }
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        return;
+    }
+
+    if(event->type == InputTypeRelease) {
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        if(event->key == InputKeyLeft) {
+            app->left_hold_active = false;
+            app->left_hold_consumed = false;
+        } else if(event->key == InputKeyOk) {
+            app->ok_hold_active = false;
+            app->ok_hold_consumed = false;
+        }
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        return;
+    }
 
     if(event->key == InputKeyBack && event->type == InputTypeLong) {
         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
         app->clear_confirm = false;
+        app->frc_confirm = false;
         app->exit_confirm = true;
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
         return;
     }
     if(event->key == InputKeyOk && event->type == InputTypeLong) {
         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        bool calibration_confirm = app->page == CO2_SCD_CAL_PAGE &&
+                                   (app->frc_confirm || app->frc_pending ||
+                                    app->ok_hold_active || app->ok_hold_consumed);
         bool exit_confirm = app->exit_confirm;
         bool enabled = app->backlight_always_on;
-        if(exit_confirm) {
+        if(calibration_confirm) {
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+            return;
+        } else if(exit_confirm) {
             app->exit_confirm = false;
             app->running = false;
         } else {
@@ -934,12 +1263,30 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
     }
     if(event->type != InputTypeShort && event->type != InputTypeRepeat) return;
 
+    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+    bool suppress_repeat = event->type == InputTypeRepeat &&
+                           ((event->key == InputKeyLeft &&
+                             (app->left_hold_active || app->left_hold_consumed)) ||
+                            (event->key == InputKeyOk &&
+                             (app->ok_hold_active || app->ok_hold_consumed)));
+    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+    if(suppress_repeat) return;
+
     if(event->key == InputKeyBack && event->type == InputTypeShort) {
         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
         if(app->exit_confirm)
             app->exit_confirm = false;
         else if(app->i2c_fatal) {
             /* The fatal page is latched; long BACK still opens exit confirmation. */
+        } else if(app->home_done && app->page == CO2_SCD_CAL_PAGE) {
+            if(app->frc_confirm)
+                app->frc_confirm = false;
+            else if(!app->frc_pending)
+                app->page = CO2_SCD_SETTINGS_PAGE;
+        } else if(app->home_done && app->page == CO2_SCD_CAL_INFO_PAGE) {
+            app->page = CO2_SCD_SETTINGS_PAGE;
+        } else if(app->home_done && app->page == CO2_SCD_SETTINGS_PAGE) {
+            app->page = CO2_RECORD_PAGE;
         } else if(app->home_done && app->page == CO2_RECORD_PAGE) {
             if(app->record_editing)
                 app->record_editing = false;
@@ -950,6 +1297,7 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
         return;
     }
+
     if(event->key == InputKeyOk && event->type == InputTypeShort) {
         furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
         if(app->exit_confirm) {
@@ -958,6 +1306,35 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
         } else if(app->clear_confirm) {
             co2_clear_history_locked(app);
             app->clear_confirm = false;
+        } else if(app->home_done && app->page == CO2_SCD_SETTINGS_PAGE) {
+            if(app->scd_settings_cursor == 0) {
+                app->scd_pressure_compensation = !app->scd_pressure_compensation;
+                app->scd_settings_save_requested = true;
+                app->scd_settings_apply_requested = true;
+            } else if(app->scd_settings_cursor == 1) {
+                app->scd_asc_enabled = !app->scd_asc_enabled;
+                app->scd_settings_save_requested = true;
+                app->scd_settings_apply_requested = true;
+            } else {
+                app->page = CO2_SCD_CAL_INFO_PAGE;
+            }
+        } else if(app->home_done && app->page == CO2_SCD_CAL_INFO_PAGE) {
+            uint16_t current = CO2_FRC_DEFAULT_PPM;
+            if(app->scd_ok && isfinite(app->CO2_PPM) && app->CO2_PPM >= 400.0f &&
+               app->CO2_PPM <= 2000.0f) {
+                current = (uint16_t)(app->CO2_PPM + 0.5f);
+            }
+            app->frc_reference_ppm = current;
+            app->frc_digit_cursor = 0;
+            app->frc_started_at = furi_get_tick();
+            app->frc_result = Co2FrcResultNone;
+            app->page = CO2_SCD_CAL_PAGE;
+        } else if(app->home_done && app->page == CO2_SCD_CAL_PAGE && !app->frc_pending &&
+                  !app->frc_confirm) {
+            if(co2_frc_reference_valid(app->frc_reference_ppm))
+                app->frc_confirm = true;
+            else
+                app->frc_result = Co2FrcResultInvalid;
         } else if(app->home_done && app->page == CO2_RECORD_PAGE) {
             if(app->recording) {
                 app->record_stop_requested = true;
@@ -975,7 +1352,32 @@ static void co2_sniffer_input_cb(InputEvent* event, void* ctx) {
 
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
     if(app->home_done && !app->clear_confirm && !app->exit_confirm && !app->i2c_fatal) {
-        if(app->page == CO2_RECORD_PAGE) {
+        if(app->page == CO2_SCD_SETTINGS_PAGE) {
+            if(event->key == InputKeyUp)
+                app->scd_settings_cursor = (app->scd_settings_cursor + 2) % 3;
+            else if(event->key == InputKeyDown)
+                app->scd_settings_cursor = (app->scd_settings_cursor + 1) % 3;
+            else if(event->key == InputKeyRight)
+                app->page = CO2_RECORD_PAGE;
+        } else if(app->page == CO2_SCD_CAL_INFO_PAGE) {
+            /* Navigation keys are intentionally ignored until OK or BACK. */
+        } else if(app->page == CO2_SCD_CAL_PAGE) {
+            if(!app->frc_confirm && !app->frc_pending) {
+                if(event->key == InputKeyUp) {
+                    app->frc_reference_ppm = co2_frc_adjust_digit(
+                        app->frc_reference_ppm, app->frc_digit_cursor, true);
+                    app->frc_result = Co2FrcResultNone;
+                } else if(event->key == InputKeyDown) {
+                    app->frc_reference_ppm = co2_frc_adjust_digit(
+                        app->frc_reference_ppm, app->frc_digit_cursor, false);
+                    app->frc_result = Co2FrcResultNone;
+                } else if(event->key == InputKeyLeft) {
+                    app->frc_digit_cursor = (app->frc_digit_cursor + 3) % 4;
+                } else if(event->key == InputKeyRight) {
+                    app->frc_digit_cursor = (app->frc_digit_cursor + 1) % 4;
+                }
+            }
+        } else if(app->page == CO2_RECORD_PAGE) {
             if(event->key == InputKeyRight) {
                 if(app->record_editing && !app->recording) {
                     if(app->record_cursor == 0)
@@ -1070,7 +1472,7 @@ static void co2_update_home_state(Co2SnifferApp* app, uint32_t now) {
         app->home_deadline_ms = 0;
     } else if(category != app->home_category) {
         app->home_category = category;
-        app->home_deadline_ms = now + (category == 2 ? 5000 : 10000);
+        app->home_deadline_ms = now + (category == 2 ? 500 : 10000);
     } else if(co2_time_reached(now, app->home_deadline_ms)) {
         app->home_done = true;
     }
@@ -1248,7 +1650,51 @@ static int32_t co2_sniffer_worker(void* ctx) {
     while(app->running) {
         now = furi_get_tick();
 
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        bool pressure_compensation = app->scd_pressure_compensation;
+        bool asc_enabled = app->scd_asc_enabled;
+        bool save_settings = app->scd_settings_save_requested;
+        bool apply_settings = app->scd_settings_apply_requested;
+        bool force_recalibration = app->frc_requested;
+        uint16_t frc_reference_ppm = app->frc_reference_ppm;
+        app->scd_settings_save_requested = false;
+        app->scd_settings_apply_requested = false;
+        app->frc_requested = false;
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+
+        if(save_settings) {
+            bool saved = co2_settings_save(storage, pressure_compensation, asc_enabled);
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            app->scd_settings_save_error = !saved;
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        }
+
+        if(apply_settings && !app->scd.fail) {
+            uint16_t pressure_mbar = 0;
+            if(pressure_compensation && !app->bmp.fail && bmp_has_measurement) {
+                uint16_t candidate = (uint16_t)((app->bmp.P_FIL + 0.5f) / 100.0f);
+                if(candidate >= 700 && candidate <= 1200) pressure_mbar = candidate;
+            }
+            if(!co2_scd30_set_asc(asc_enabled) || !co2_scd30_set_pressure(pressure_mbar)) {
+                app->scd.fail = true;
+                scd_has_measurement = false;
+            } else {
+                scd_press_bak = pressure_mbar;
+            }
+        }
+
+        if(force_recalibration) {
+            bool calibrated = !app->scd.fail &&
+                              co2_scd30_force_recalibration(frc_reference_ppm);
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            app->frc_pending = false;
+            app->frc_result = calibrated ? Co2FrcResultSuccess : Co2FrcResultFailure;
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        }
+
         if(app->bmp.fail) {
+            /* A responding device after any disconnect is treated as newly
+             * powered: run its complete reset and calibration-data init. */
             if(co2_bmp388_init(&app->bmp)) {
                 /* Do not blend a post-reconnect pressure with the old sensor
                  * session before feeding SCD30 compensation. */
@@ -1275,14 +1721,16 @@ static int32_t co2_sniffer_worker(void* ctx) {
         }
 
         if(app->scd.fail) {
+            /* Reconnected SCD30 instances always receive the same full init
+             * sequence as a newly powered sensor. */
             /* Passing zero explicitly disables pressure compensation when the
              * BMP388 is absent. */
             uint16_t pressure_mbar = 0;
-            if(!app->bmp.fail && bmp_has_measurement) {
+            if(pressure_compensation && !app->bmp.fail && bmp_has_measurement) {
                 uint16_t candidate = (uint16_t)((app->bmp.P_FIL + 0.5f) / 100.0f);
                 if(candidate >= 700 && candidate <= 1200) pressure_mbar = candidate;
             }
-            if(co2_scd30_init(&app->scd, pressure_mbar)) {
+            if(co2_scd30_init(&app->scd, pressure_mbar, asc_enabled)) {
                 scd_press_bak = pressure_mbar;
                 scd_warmup_until = furi_get_tick() + CO2_SCD_WARMUP_MS;
                 scd_has_measurement = false;
@@ -1292,8 +1740,9 @@ static int32_t co2_sniffer_worker(void* ctx) {
             if(app->scd.fail) scd_has_measurement = false;
 
             uint16_t pressure_mbar = (uint16_t)((app->bmp.P_FIL + 0.5f) / 100.0f);
-            if(!app->scd.fail && !app->bmp.fail && bmp_has_measurement && pressure_mbar >= 700 &&
-               pressure_mbar <= 1200 && pressure_mbar != scd_press_bak) {
+            if(pressure_compensation && !app->scd.fail && !app->bmp.fail &&
+               bmp_has_measurement && pressure_mbar >= 700 && pressure_mbar <= 1200 &&
+               pressure_mbar != scd_press_bak) {
                 scd_press_bak = pressure_mbar;
                 if(!co2_scd30_set_pressure(pressure_mbar)) {
                     app->scd.fail = true;
@@ -1310,6 +1759,8 @@ static int32_t co2_sniffer_worker(void* ctx) {
             app->recording = false;
             app->record_start_requested = false;
             app->record_stop_requested = false;
+            app->frc_pending = false;
+            app->frc_result = Co2FrcResultFailure;
             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
             break;
         }
@@ -1342,6 +1793,9 @@ static int32_t co2_sniffer_worker(void* ctx) {
                           co2_time_reached(now, bmp_warmup_until);
         bool scd_usable = !app->scd.fail && scd_has_measurement &&
                           co2_time_reached(now, scd_warmup_until);
+        /* Rebuild validity every loop so no pre-disconnect sample can leak
+         * into a graph during either sensor's 10-second discard interval. */
+        carried_valid = 0;
         if(scd_usable) {
             carried[Co2MetricCo2] = app->scd.CO2_PPM;
             carried[Co2MetricTemperature] = app->scd.T_SCD;
@@ -1473,6 +1927,19 @@ int32_t co2_sniffer_app(void* p) {
 
     Co2SnifferApp* app = malloc(sizeof(Co2SnifferApp));
     memset(app, 0, sizeof(*app));
+    app->scd_pressure_compensation = true;
+    app->scd_asc_enabled = false;
+    app->frc_reference_ppm = CO2_FRC_DEFAULT_PPM;
+
+    Storage* settings_storage = furi_record_open(RECORD_STORAGE);
+    bool settings_loaded = co2_settings_load(
+        settings_storage, &app->scd_pressure_compensation, &app->scd_asc_enabled);
+    if(!settings_loaded) {
+        app->scd_settings_save_error = !co2_settings_save(
+            settings_storage, app->scd_pressure_compensation, app->scd_asc_enabled);
+    }
+    furi_record_close(RECORD_STORAGE);
+
     app->gui = furi_record_open(RECORD_GUI);
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
@@ -1490,6 +1957,7 @@ int32_t co2_sniffer_app(void* p) {
     furi_thread_start(app->worker);
 
     while(app->running) {
+        co2_process_hold_actions(app);
         view_port_update(app->view_port);
         furi_delay_ms(100);
     }

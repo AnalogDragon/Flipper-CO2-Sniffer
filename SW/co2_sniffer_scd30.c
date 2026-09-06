@@ -10,6 +10,7 @@
 #define SCD_CMD_STOP_MEAS 0x0104
 #define SCD_CMD_SET_INTERVAL 0x4600
 #define SCD_CMD_SET_ASC 0x5306
+#define SCD_CMD_FORCE_RECAL 0x5204
 #define SCD_CMD_READY 0x0202
 #define SCD_CMD_READ_MEAS 0x0300
 
@@ -59,7 +60,23 @@ static float sensirion_bytes_to_float(uint32_t bytes) {
     return tmp.float32;
 }
 
-bool co2_scd30_init(Co2Scd30* s, uint16_t press_mbar) {
+bool co2_scd30_set_asc(bool enabled) {
+    uint8_t d[3] = {0x00, enabled ? 0x01 : 0x00, 0};
+    d[2] = sen_crc(d, 2);
+    return scd30_write(SCD_CMD_SET_ASC, d, sizeof(d));
+}
+
+bool co2_scd30_force_recalibration(uint16_t reference_ppm) {
+    if(reference_ppm < 400 || reference_ppm > 2000) return false;
+
+    uint8_t d[3] = {(uint8_t)(reference_ppm >> 8), (uint8_t)reference_ppm, 0};
+    d[2] = sen_crc(d, 2);
+    bool sent = scd30_write(SCD_CMD_FORCE_RECAL, d, sizeof(d));
+    if(sent) furi_delay_ms(4); /* command execution time from the datasheet */
+    return sent;
+}
+
+bool co2_scd30_init(Co2Scd30* s, uint16_t press_mbar, bool asc_enabled) {
     s->fail = true;
 
     /* The CH552 board power-cycled the sensor here; the Flipper board has
@@ -67,13 +84,11 @@ bool co2_scd30_init(Co2Scd30* s, uint16_t press_mbar) {
     if(!scd30_cmd(SCD_CMD_SOFT_RESET)) return false;
     furi_delay_ms(200);
 
-    /* disable automatic self-calibration (ASC) */
-    uint8_t d[3] = {0x00, 0x00, 0};
-    d[2] = sen_crc(d, 2);
-    if(!scd30_write(SCD_CMD_SET_ASC, d, 3)) return false;
+    if(!co2_scd30_set_asc(asc_enabled)) return false;
     furi_delay_ms(100);
 
     /* measurement interval 2 s */
+    uint8_t d[3];
     d[0] = 0x00;
     d[1] = 0x02;
     d[2] = sen_crc(d, 2);
