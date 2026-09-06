@@ -2,102 +2,129 @@
 
 # CO2 Sniffer
 
-BMP388 + SCD30 add-on board and app for the Flipper Zero. The board plugs into the
-Flipper's GPIO pins; the app reads both sensors over the external I2C bus, shows the
-values on screen, and streams a framed report to a PC over USB CDC.
+CO2 Sniffer is a BMP388 + SCD30 environmental monitor for the Flipper Zero. Plug
+the board into the GPIO header and open the app to view CO2, temperature,
+humidity, pressure and estimated altitude. Readings can also be saved to the
+microSD card or sent to a computer over USB.
 The software project in `SW/` was developed by OpenAI Codex.
 
-## Current features
+![CO2 Sniffer running on a Flipper Zero](docs/co2-sniffer-installed.jpg)
 
-- Reads CO2, temperature and humidity from the SCD30, and temperature and
-  pressure from the BMP388.
-- Shows live readings in several dashboard layouts, including an estimated
-  altitude calculated from pressure.
-- Provides history graphs for CO2, temperature, humidity, pressure and altitude
-  with selectable time scales.
-- Streams readings to a PC over USB CDC and records timestamped CSV files to the
-  microSD card with configurable intervals and durations.
-- Detects sensor and I2C bus faults, retries or recovers automatically, keeps
-  working with one sensor, and requests a restart if bus recovery fails.
+## Main features
+
+- Measures CO2, temperature, humidity and pressure, and estimates altitude from
+  the pressure reading.
+- Offers several live dashboard layouts and history graphs for all five values.
+- Saves readings to CSV at a chosen interval and duration, or sends them to a
+  computer over USB.
+- Continues with the remaining sensor if one becomes unavailable and reconnects
+  it automatically when possible.
+
+To keep startup transients out of the trend, history graphs omit the first 10
+seconds after the app starts or the SCD30 reconnects.
 
 ## Controls
 
-| Input | Action |
-| ----- | ------ |
-| **LEFT / RIGHT** | Browse the recording page, dashboard and five history graphs; change a recording value while editing it |
-| **UP / DOWN** | Change the dashboard layout or graph time scale; move between fields on the recording page |
-| Short **OK** | Edit or confirm a field, toggle an SCD30 option, start/stop recording, or confirm a dialog |
-| Short **BACK** | Leave recording-field editing, return from the recording page to the dashboard, open/cancel the clear-history dialog, or cancel the exit dialog |
-| Long **LEFT / OK / BACK** | From Data Recording, hold LEFT for 2 seconds to open SCD30 Calibration; OK confirms manual calibration or toggles the backlight elsewhere; BACK opens the exit confirmation |
+Button functions change with the current screen. All actions below are short
+presses unless marked as a hold.
+
+| Current screen | Input | Function |
+| -------------- | ----- | -------- |
+| Dashboard | **LEFT** | Open **Data Recording** |
+| Dashboard | **RIGHT** | Open the first history graph |
+| History graph | **LEFT / RIGHT** | Show the previous / next graph; return to the dashboard at either end |
+| Dashboard | **UP / DOWN** | Change the dashboard layout |
+| History graph | **UP / DOWN** | Change the graph time scale |
+| Dashboard / history graph | **BACK** | Open the clear-history prompt; press **OK** to clear or **BACK** to cancel |
+| Data Recording | **UP / DOWN** | Select the interval, length or **Start** field |
+| Data Recording | **OK** | Change the selected setting; start when **Start** is selected, or stop while recording |
+| Changing a recording setting | **LEFT / RIGHT** | Choose the required value |
+| Changing a recording setting / Data Recording | **BACK** | Finish the current change; when not changing a setting, return to the dashboard |
+| SCD30 settings | **UP / DOWN**, **OK** | Choose a setting and change it, or open manual calibration |
+| Manual-calibration input | **LEFT / RIGHT**, **UP / DOWN** | Select and adjust a digit; press **OK** to review the value |
+
+The following functions require a button hold:
+
+| Where | Input | Function |
+| ----- | ----- | -------- |
+| Data Recording, while not changing a setting | Hold **LEFT** for 2 seconds | Open SCD30 settings |
+| While reviewing a manual-calibration value | Hold **OK** for 2 seconds | Start calibration after the progress bar completes |
+| When no calibration or exit prompt is shown | Hold **OK** | Turn the always-on backlight on or off |
+| Any page | Hold **BACK** | Open the exit prompt; press **OK** to exit or **BACK** to cancel |
+
+![CO2 Sniffer page navigation and controls flowchart](docs/operation-flow.png)
 
 ## Data recording
 
-Press **LEFT** from the dashboard to open **Data Recording**. Use **UP / DOWN**
-to select a field, short **OK** to edit it, and **LEFT / RIGHT** to change its
-value. Both setting lists wrap around in either direction. Short-press **BACK**
-while editing to leave the field, or from the recording page to return to the
-dashboard. Select **Start** and press **OK** to begin; press **OK** again to stop.
+Data recording is useful for tracking environmental changes over time. Press
+**LEFT** from the dashboard to open **Data Recording**, choose the interval and
+recording length, then select **Start**. Recording ends automatically at the
+chosen time. For a continuous recording, or to stop early, press **OK**.
 
 | Setting | Choices |
 | ------- | ------- |
 | Interval | 2 s, 5 s, 10 s, 30 s, 1 min |
 | Length | 1 min, 5 min, 10 min, 30 min, 1 h, 2 h, 8 h, 24 h, continuous |
 
-Files are saved as
-`/ext/co2_sniffer/YYYYMMDD_HHMMSS_<interval>_<length>.csv`. The columns are
-`timestamp`, `elapsed_s`, `co2_ppm`, `scd30_temperature_c`, `humidity_pct`,
-`bmp388_temperature_c`, `pressure_hpa` and `altitude_m`. Values from an
-unavailable sensor are left empty. A blinking `REC` badge shows that recording
-is active; `SD!` reports a file or microSD write error.
+Files are saved in `/ext/co2_sniffer/` on the microSD card. Each filename
+includes the start time, interval and recording length. Every row contains the
+time, elapsed recording time and available sensor readings; values from a
+temporarily unavailable sensor are left empty. A blinking `REC` badge means
+recording is active. If `SD!` appears, check that the microSD card is available
+and writable.
 
-## SCD30 calibration
+## SCD30 settings and calibration
 
 From **Data Recording**, hold **LEFT** for 2 seconds to open **SCD30
-Calibration**. Use **UP / DOWN** and short **OK** to configure pressure
-compensation or automatic self-calibration (ASC). Both settings are saved in
-`/ext/co2_sniffer/settings.bin` and applied when the app starts. If the file is
-missing or invalid, pressure compensation defaults to on and ASC defaults to
-off.
+Calibration**. It provides two everyday settings:
 
-Select **Manual calibration** and follow the warning screen. On the calibration
-screen, **LEFT / RIGHT** selects one of four digits and **UP / DOWN** changes it
-with wraparound. The valid SCD30 forced-recalibration range is 0400–2000 ppm.
-Short-press **OK** to review the value, then hold **OK** for 2 seconds until the
-progress bar completes. Keep the sensor in stable reference air for at least
-two minutes before confirming, and keep your face away from the
-sensor throughout calibration. Use a known reference concentration rather
-than assuming outdoor air is exactly 400 ppm. Graph history discards the first
-10 seconds of readings after startup and every sensor reconnection.
+- **Pressure comp** uses the current pressure measured by the BMP388 to improve
+  SCD30 measurement accuracy.
+- **Auto calib (ASC)** lets the SCD30 adjust its baseline during long-term use.
+
+Pressure compensation is on and ASC is off by default. The app remembers later
+changes and uses them again at the next startup.
+
+### Manual calibration
+
+Manual calibration is recommended only when the reading has a clear offset and
+a reliable CO2 reference concentration is available. Do not treat outdoor air
+as an exact 400 ppm reference.
+
+Before calibration, leave the sensor running in a stable reference environment
+for at least two minutes and keep faces away from it. Select **Manual
+calibration**, enter the actual reference concentration (`0400–2000 ppm`), and
+press **OK** to review it. Hold **OK** for 2 seconds; calibration starts only
+after the progress bar completes, using the value entered as its reference.
 
 ## Hardware
 
-`HW/` is a KiCad project. The board is a 2.54 mm 1×10 pin header module that
-plugs into the Flipper's GPIO port:
+The board connects to the Flipper GPIO port through a 2.54 mm 1×10 pin header
+and carries the following sensors:
 
 | Device | Role | I2C address |
 | ------ | ---- | ----------- |
 | Sensirion SCD30 | CO2, temperature, humidity | 0x61 |
 | Bosch BMP388 | temperature, pressure | 0x76 |
 
-I2C runs on GPIO C0 (SCL) / C1 (SDA); the board is powered from the Flipper's
-3V3/5V pins. `HW/Flipper-CO2-module-V10/` contains the V1.0 gerbers, ready for
-fabrication.
+I2C runs on GPIO C0 (SCL) / C1 (SDA), and the board is powered from the
+Flipper's 3V3/5V pins. KiCad schematic and PCB design sources are in `HW/`.
 
-## Software
+![CO2 Sniffer module hardware](docs/module-hardware.jpg)
 
-`SW/` is a Flipper application (FAP, appid `co2_sniffer`, category DIY, v0.5).
-Its main flow is:
+![CO2 Sniffer module enclosure from multiple angles](docs/module-enclosure.jpg)
 
-1. Detect and initialize the SCD30 and BMP388.
-2. Read the available sensors and update the live dashboard.
-3. Record readings for the history graph pages.
-4. Send readings through USB CDC and optionally save them as CSV.
-5. Retry disconnected sensors automatically and restore system settings on exit.
+## Fault handling
+
+If one sensor is temporarily disconnected, its readings are shown as
+unavailable while the other sensor continues to work. The app attempts to
+restore the connection automatically. If the screen reports that the I2C bus
+cannot be recovered, exit the app and restart the Flipper as instructed.
 
 ## Layout
 
-- `HW/` — KiCad board: schematic, PCB, V1.0 gerbers in `Flipper-CO2-module-V10/`.
-- `SW/` — Flipper app sources; builds are written under `SW/dist/`.
+- `HW/` — KiCad schematic and PCB design sources.
+- `SW/` — Flipper app sources.
 - `3d/` — Printable enclosure files: a 3MF with Bambu Lab settings and the original STEP model.
 - `PROTOCOL.md` — full USB CDC serial protocol documentation.
 - `README-zh.md` — this document in Chinese.
@@ -106,18 +133,9 @@ Its main flow is:
 
 GPL-3.0, see [LICENSE](LICENSE).
 
-## Build & install
+## USB data output
 
-```sh
-cd SW
-ufbt            # builds dist/co2_sniffer.fap
-ufbt launch     # installs and runs on a connected Flipper
-```
-
-The app installs under `/ext/apps/DIY/` (FAP category DIY).
-
-## Serial frame
-
-The app sends a compact binary report over USB CDC. On the PC, use the second
-virtual COM port; the first one is the Flipper CLI console. See
+To receive live readings on a computer, connect the Flipper over USB and select
+the second virtual COM port detected by the system. The first port is reserved
+for the Flipper CLI. Measurements use a binary frame format; see
 **[PROTOCOL.md](PROTOCOL.md)** for the complete frame format and parsing details.
